@@ -1,0 +1,18 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# local state & logs
+NEW/chats/
+data/agent_state.sqlite
+data/agent_state.sqlite-*
+data/*.sqlite*
+chats/
+.streamlit/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/

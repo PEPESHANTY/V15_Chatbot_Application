@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  riceai:
+    build: .
+    container_name: riceai_app
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app   # mount project root so container sees NEW/app.py
+    working_dir: /app
+    command: >
+      python -m streamlit run NEW/app.py
+      --server.port=8501
+      --server.address=0.0.0.0

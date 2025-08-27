@@ -1,0 +1,33 @@
+# Core logic engine
+langgraph
+langchain
+langchain-core
+langchain-community
+langgraph-checkpoint-sqlite
+# LLM providers (OpenAI or vLLM/Qwen-compatible)
+openai
+langchain-openai
+
+# Prompting and parsing
+tiktoken
+tenacity
+
+# Graph and vector tools (used by LangGraph or future extensions)
+networkx
+numpy
+scikit-learn
+
+# Typing, parsing, metadata
+pydantic
+typing-extensions
+
+# Environment management
+dotenv
+
+# CLI & logging
+rich
+streamlit
+qdrant-client
+langchain_neo4j
+boto3
+
