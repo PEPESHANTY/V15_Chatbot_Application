@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY ../requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # copy project (so NEW/app.py becomes /app/NEW/app.py)

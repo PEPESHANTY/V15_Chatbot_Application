@@ -2,6 +2,7 @@
 # SQLite checkpointing + S3 write-through for chats and SQLite backups
 
 import os
+import re
 import json
 import time
 import sqlite3
@@ -19,7 +20,9 @@ from langchain.schema import Document
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+)
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain.tools import tool
@@ -126,7 +129,6 @@ def format_document_details(docs: List[Document]) -> str:
     blocks = []
     for doc in docs:
         meta = doc.metadata or {}
-
         blocks.append(
             f"- **Title:** {meta.get('title', 'No title')} (score: {meta.get('score', 0):.3f})  \n"
             f"  **URL:** {meta.get('url', 'N/A')}  \n"
@@ -142,6 +144,41 @@ def build_memory_system_prompt(user_facts: Dict[str, str]) -> str:
     parts = [f"- {k}: {v}" for k, v in user_facts.items() if str(v).strip()]
     return "Known user facts:\n" + "\n".join(parts)
 
+# -------- intent & ag-question heuristics (less sensitive) --------
+QUESTION_CUE_PAT = re.compile(
+    r"\b(what|how|when|where|why|which|should|can|could|would|advise|recommend|rate|"
+    r"calculate|compare|best|steps|practice|guide|help|list|tell me)\b|\?",
+    re.I,
+)
+
+AG_TOKENS = (
+    r"rice|paddy|variet|seed|nursery|transplant|sow|broadcast|yield|"
+    r"fertiliz|urea|dap|npk|kcl|organic|compost|manure|"
+    r"aw[dt]|irrigat|drain|flood|water|soil|"
+    r"ipm|pest|insect|weed|herbicide|fungicide|pesticide|disease|blast|bph|"
+    r"harvest|dry|mill|straw|residue|mrl|ban list|regulation"
+)
+AG_PAT = re.compile(rf"\b(?:{AG_TOKENS})\b", re.I)
+
+GREET_PAT = re.compile(r"\b(hi|hello|hey|good\s+(morning|afternoon|evening))\b", re.I)
+SELF_INFO_PAT = re.compile(
+    r"\b(i\s*(?:am|'m|study|studying|work|working|live|living|from|in|at)|"
+    r"my\s*(?:name|college|university|job|profession|location)\b)",
+    re.I,
+)
+
+def _looks_like_ag_question(text: str) -> bool:
+    """Return True only when it's clearly an agriculture *question*."""
+    t = (text or "").strip().lower()
+    if not QUESTION_CUE_PAT.search(t):
+        return False
+    ag_hits = re.findall(AG_PAT, t)
+    return ("rice" in t) or (len(ag_hits) >= 2)
+
+def _is_self_info_or_greeting(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(GREET_PAT.search(t) or SELF_INFO_PAT.search(t))
+
 # =========================
 # Tools (Qdrant + Neo4j KG)
 # =========================
@@ -151,14 +188,7 @@ def build_memory_system_prompt(user_facts: Dict[str, str]) -> str:
     description="Vector-search Qdrant for relevant rice/ag documents. Args: query, k, threshold. Returns: {'hits':[...]}."
 )
 def qdrant_search(query: str, k: int = 5, threshold: float = 0.35) -> Dict[str, Any]:
-    """Vector-search Qdrant for rice/ag documents.
-        Args:
-            query: natural language question
-            k: number of results
-            threshold: score threshold (0–1)
-        Returns:
-            dict: {"hits": [{"score": float, "content": str, "title": str, ...}]}
-        """
+    """Vector-search Qdrant for rice/ag documents."""
     print(f"[tool:qdrant_search] query='{query}', k={k}, threshold={threshold}")
     emb = get_query_embedding(query)
     results = qdrant.search(
@@ -190,13 +220,7 @@ def qdrant_search(query: str, k: int = 5, threshold: float = 0.35) -> Dict[str, 
     description="Query the Neo4j knowledge graph and return a grounded answer with facts. Args: query, limit. Returns: {'hits':[...]}."
 )
 def neo4j_kg_search(query: str, limit: int = 5) -> Dict[str, Any]:
-    """Query Neo4j knowledge graph for grounded answers and facts.
-        Args:
-            query: natural language question
-            limit: number of items to return
-        Returns:
-            dict: {"hits": [{"score": float, "content": str, "title": str, ...}]}
-        """
+    """Query Neo4j knowledge graph for grounded answers and facts."""
     print(f"[tool:neo4j_kg_search] query='{query}', limit={limit}")
     from math import isfinite
     KG_MAX_DISTANCE = float(os.getenv("KG_MAX_DISTANCE", "0.85"))
@@ -269,13 +293,7 @@ rewriter_system = SystemMessage(content=(
     "Rewrite the user's latest message as a single, standalone query optimized for retrieval.\n"
     "Preserve key entities (e.g., Vietnam, Mekong Delta), inputs (crop stage/soil), and regulatory intent.\n"
     "Prefer adding clarifying terms like 'rice', 'agriculture', 'IPM', 'MRL', 'ban list', 'regulation' when implied.\n"
-    "Examples:\n"
-    " - 'hey can you help me with AWD for heavy clay soils?' -> 'Best AWD practices for heavy clay rice soils (Vietnam context).'\n"
-    " - 'how much urea should I use on 1 ha?' -> 'Recommended urea rates per hectare in irrigated rice (Vietnam).'\n"
-    " - 'tell me about insecticides and pesticides banned in vietnamese' -> "
-    "'Pesticides/insecticides banned or restricted in Vietnam rice production (official ban list, MRLs, current rules).'\n"
-    " - 'tell me pesticides for farming banned in vietnam' -> "
-    "'Pesticides banned/restricted for crop farming in Vietnam, with rice-specific notes and safer alternatives (IPM).'\n"
+    "Return ONLY the refined query."
 ))
 
 planner_system = SystemMessage(content=(
@@ -340,20 +358,51 @@ class GradeDocument(BaseModel):
 # =========================
 def question_rewriter(state: AgentState) -> AgentState:
     print("=== Entering question_rewriter ===")
-    state.setdefault("user_facts", {})
-    state.setdefault("messages", [])
-    state.setdefault("rephrase_count", 0)
 
-    if state.get("question") and state["question"] not in state["messages"]:
-        state["messages"].append(state["question"])
+    # ---- normalize state WITHOUT setdefault ----
+    # user_facts -> dict
+    if not isinstance(state.get("user_facts"), dict):
+        state["user_facts"] = {}
+    # messages -> list
+    msgs = state.get("messages")
+    if not isinstance(msgs, list):
+        msgs = []
+    state["messages"] = msgs
+    # rephrase_count -> int
+    rc = state.get("rephrase_count")
+    if not isinstance(rc, int):
+        rc = 0
+    state["rephrase_count"] = rc
 
-    q = state["question"].content if state.get("question") else ""
+    # ---- read question & append safely ----
+    q_msg = state.get("question")
+    if isinstance(q_msg, HumanMessage):
+        q = q_msg.content or ""
+        # only append if last human content differs
+        if not state["messages"] or not (
+            isinstance(state["messages"][-1], HumanMessage)
+            and state["messages"][-1].content == q
+        ):
+            state["messages"].append(q_msg)
+    elif isinstance(q_msg, BaseMessage):
+        q = q_msg.content or ""
+        state["messages"].append(q_msg)
+    elif isinstance(q_msg, str):
+        q = q_msg
+        state["messages"].append(HumanMessage(content=q))
+    else:
+        q = ""
+
+    # default to original
     state["rephrased_question"] = q
 
-    if len(state["messages"]) > 1:
-        conversation = _clean_msgs_for_llm(state["messages"][:-1])
-    else:
-        conversation = []
+    # small-talk/greeting? keep original, skip rewriting
+    if _is_self_info_or_greeting(q) or (len(q.split()) <= 4 and not _looks_like_ag_question(q)):
+        print("[question_rewriter] small-talk -> keep original")
+        return state
+
+    # include recent context (strip tool messages)
+    conversation = _clean_msgs_for_llm(state["messages"][:-1]) if len(state["messages"]) > 1 else []
 
     rewriter_system_local = SystemMessage(content=(
         "Rewrite the user's latest message as a single, standalone query optimized for retrieval. "
@@ -362,11 +411,8 @@ def question_rewriter(state: AgentState) -> AgentState:
         "Return ONLY the refined query."
     ))
 
-    human = HumanMessage(content=q or "N/A")
-    msgs: List[BaseMessage] = [rewriter_system_local] + conversation + [human]
-
     try:
-        resp = rewriter_llm.invoke(msgs)
+        resp = rewriter_llm.invoke([rewriter_system_local, *conversation, HumanMessage(content=q or "N/A")])
         refined = (resp.content or "").strip()
         if refined:
             state["rephrased_question"] = refined
@@ -378,19 +424,20 @@ def question_rewriter(state: AgentState) -> AgentState:
 
     return state
 
+
 def fact_extractor(state: AgentState) -> AgentState:
-    print("=== Entering fact_extractor ===")
+    print("=== Entering fact_extractor (LLM memory) ===")
     state.setdefault("user_facts", {})
     latest = state["question"].content
 
+    # LLM-first extraction (JSON only)
     system = SystemMessage(content=(
-        "From the user's last message, extract any stable personal facts as a compact JSON object.\n"
+        "From the user's last message, extract stable personal facts as a *compact JSON object*.\n"
         "Allowed keys: name, location, city, country, residence, profession, college, farm_size, rice_variety, "
         "role, company, preferences, email, phone, other.\n"
         "Return ONLY JSON. If none, return {}."
     ))
     human = HumanMessage(content=latest)
-
     data: Dict[str, str] = {}
     try:
         resp = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY).invoke([system, human])
@@ -400,7 +447,7 @@ def fact_extractor(state: AgentState) -> AgentState:
     except Exception:
         data = {}
 
-    import re
+    # Heuristic fallback from raw text
     if not data.get("location"):
         m = re.search(r"\b(?:i\s*(?:am|'m)?\s*(?:from|in)|i\s*live\s*in|living\s*in|reside\s*in)\s+([A-Za-z .,'-]+)", latest, re.I)
         if m:
@@ -408,30 +455,50 @@ def fact_extractor(state: AgentState) -> AgentState:
             if loc:
                 data["location"] = loc
     if not data.get("name"):
-        m = re.search(r"\b(?:i\s*am|i'm)\s+([A-Za-z][A-Za-z .'-]{1,40})$", latest.strip(), re.I)
+        m = re.search(r"\b(?:my\s*name\s*is|i\s*am|i'm)\s+([A-Za-z][A-Za-z .'-]{1,40})\b", latest.strip(), re.I)
         if m:
             data["name"] = m.group(1).strip(" .,'-")
+    if not data.get("college"):
+        m = re.search(r"\b(?:study|studying|student)\s+(?:at\s+)?([A-Za-z][A-Za-z .&'-]{1,80})\b", latest, re.I)
+        if m:
+            data["college"] = m.group(1).strip(" .,'-")
 
     if isinstance(data, dict):
         cleaned = {k: str(v).strip() for k, v in data.items() if str(v).strip()}
         if cleaned:
             state["user_facts"].update(cleaned)
-            print(f"[fact_extractor] Updated user_facts: {state['user_facts']}")
+            print(f"[fact_extractor] user_facts = {state['user_facts']}")
     return state
 
 def question_classifier(state: AgentState) -> AgentState:
     print("=== Entering question_classifier ===")
+    q = state.get("rephrased_question", "") or state.get("question", HumanMessage(content="")).content
+
+    # If it's clearly self-info or greeting -> chit-chat path
+    if _is_self_info_or_greeting(q):
+        state["label"] = "chitchat"
+        print("[question_classifier] self-info/greeting -> chitchat")
+        return state
+
+    # Strict ag-question heuristic
+    if _looks_like_ag_question(q):
+        state["label"] = "rice"
+        print("[question_classifier] heuristics -> rice")
+        return state
+
+    # LLM fallback (bias toward chit-chat)
     system_message = SystemMessage(
         content=(
-            "Classify the user's request into one label. Default to 'rice' if it is even loosely "
-            "about crops, farming, land, water, pests, pesticides/insecticides/herbicides/fungicides, "
-            "fertilizers, diseases, varieties, harvest, storage, milling, markets, etc.\n"
-            "- 'rice' = any agriculture topic (inclusive).\n"
-            "- 'chitchat' = greetings/small talk/identity/thanks/jokes.\n"
-            "- 'offtopic' = truly unrelated."
+            "Classify the user's message into one label.\n"
+            "Use 'rice' only if they are *asking* for agriculture/rice information or advice "
+            "(AWD, IPM, fertilizer, pests, water, soils, varieties, harvest, markets, MRLs, etc.).\n"
+            "'chitchat' covers greetings, small talk, or when the user is simply sharing personal information "
+            "(name, location, college, job) without requesting advice.\n"
+            "'offtopic' is unrelated.\n"
+            "If uncertain, choose 'chitchat'."
         )
     )
-    human_message = HumanMessage(content=f"User message: {state['rephrased_question']}\nLabel:")
+    human_message = HumanMessage(content=f"User message: {q}\nLabel (rice|chitchat|offtopic):")
     grade_prompt = ChatPromptTemplate.from_messages([system_message, human_message])
     grader_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY).with_structured_output(GradeLabel)
     result = (grade_prompt | grader_llm).invoke({})
@@ -471,7 +538,11 @@ def collect_tool_results(state: AgentState) -> AgentState:
         cid = h.get("chunk_id") or f"row_{len(best_by_chunk)}"
         if cid not in best_by_chunk or h.get("score", 0) > best_by_chunk[cid].get("score", 0):
             best_by_chunk[cid] = h
-    ordered = sorted(best_by_chunk.values(), key=lambda x: x.get("score, 0") if isinstance(x.get("score"), str) else x.get("score", 0), reverse=True)
+    ordered = sorted(
+        best_by_chunk.values(),
+        key=lambda x: x.get("score", 0) if not isinstance(x.get("score"), str) else float(x.get("score") or 0),
+        reverse=True
+    )
 
     docs: List[Document] = []
     for h in ordered:
@@ -527,6 +598,13 @@ def refine_question(state: AgentState) -> AgentState:
     if state.get("rephrase_count", 0) >= 2:
         return state
     q = state["rephrased_question"]
+
+    # If it doesn't look like an ag question, stop refining (prevents loops on self-info)
+    if not _looks_like_ag_question(q):
+        print("[refine_question] not an ag question -> stop refining")
+        state["rephrase_count"] = 2
+        return state
+
     rewriter_system2 = SystemMessage(content=(
         "Rewrite the user's latest message as a single, standalone query optimized for retrieval. "
         "Preserve key entities and constraints. Return ONLY the refined query."
@@ -542,14 +620,14 @@ def refine_question(state: AgentState) -> AgentState:
 
 def generate_answer(state: AgentState) -> AgentState:
     print("=== Entering generate_answer ===")
-    history = state["messages"]
-    documents = state["documents"]
-    rq = state["rephrased_question"]
+    history = state.get("messages", [])
+    documents = state.get("documents", [])
+    rq = state.get("rephrased_question", "")
     context_str = "\n\n".join(doc.page_content for doc in documents)
     memory_system = build_memory_system_prompt(state.get("user_facts", {}))
 
     response = rag_chain.invoke({
-        "history": history,
+        "history": _summarize_msgs_for_prompt(history),
         "context": context_str,
         "question": rq,
         "memory_system": memory_system,
@@ -563,44 +641,119 @@ def generate_answer(state: AgentState) -> AgentState:
     sources_md = format_document_details(documents)
     final_text = f"{generation}\n\n---\n### Sources used\n{sources_md}"
 
+    state.setdefault("messages", [])
     state["messages"].append(AIMessage(content=final_text))
     print("[generate_answer] Done. (Answer + sources appended to state['messages'])")
     return state
 
+def answer_from_recent_context(state: AgentState, question: str) -> Optional[str]:
+    ctx = "\n".join(state.get("recent_context", [])[-12:])
+    if not ctx.strip():
+        return None
+    sys = SystemMessage(content=(
+        "You will answer ONLY using the snippets below from recent turns. "
+        "If the answer is not directly implied, reply exactly with NO_ANSWER."
+        "\n\nSnippets:\n" + ctx
+    ))
+    resp = chitchat_llm.invoke([sys, HumanMessage(content=question)])
+    text = (resp.content or "").strip()
+    if text.upper().startswith("NO_ANSWER") or len(text) == 0:
+        return None
+    return text
+
+
 def chit_chat(state: AgentState) -> AgentState:
     print("=== Entering chit_chat ===")
-    facts = state.get("user_facts", {})
-    q = state["question"].content.strip()
+
+    # normalize
+    if not isinstance(state.get("messages"), list):
+        state["messages"] = []
+    facts = state.get("user_facts", {}) or {}
+
+    # read user question safely
+    q_obj = state.get("question")
+    q = q_obj.content if hasattr(q_obj, "content") else (q_obj or "")
+    q = (q or "").strip()
     qlow = q.lower()
 
-    if any(kw in qlow for kw in ["what's my name", "whats my name", "my name", "who am i"]):
-        name = facts.get("name")
-        text = f"You told me your name is **{name}**. 🙂" if name else \
-               "I don't have your name saved yet—tell me what you'd like me to call you and I’ll remember it."
-    elif any(kw in qlow for kw in ["where do i live", "my current place of residence", "where am i from", "where i live"]):
-        loc = facts.get("location") or facts.get("city") or facts.get("country") or facts.get("residence")
+    # ---------- 1) try answering purely from recent_context ----------
+    try:
+        recent_ans = answer_from_recent_context(state, q)  # your helper
+    except NameError:
+        recent_ans = None
+    if recent_ans:
+        state["messages"].append(AIMessage(content=recent_ans))
+        return state
+
+    # ---------- 2) specific easy asks ----------
+    if re.search(r"\b(what'?s|what is)\s+my\s+name\b|\bwho\s+am\s+i\b", qlow):
+        name = (facts.get("name") or "").strip()
+        text = f"You told me your name is **{name}**." if name else \
+               "I don't have your name yet—what should I call you?"
+        state["messages"].append(AIMessage(content=text))
+        return state
+
+    if re.search(r"\bwhere\s+do\s+i\s+live\b|\bwhere\s+am\s+i\s+from\b|\bmy\s+current\s+place\b|\bwhere\s+i\s+live\b", qlow):
+        loc = (facts.get("location") or facts.get("city") or facts.get("country") or facts.get("residence") or "").strip()
         text = f"You told me you live in **{loc}**." if loc else \
                "I don't have your location yet—where do you live?"
-    elif "tell me about myself" in qlow or "what do you know about me" in qlow:
-        bits = []
-        if facts.get("name"): bits.append(f"your name is **{facts['name']}**")
-        if facts.get("location"): bits.append(f"you live in **{facts['location']}**")
-        if facts.get("rice_variety"): bits.append(f"you grow **{facts['rice_variety']}**")
-        if facts.get("farm_size"): bits.append(f"your farm size is **{facts['farm_size']}**")
-        if facts.get("profession"): bits.append(f"you are a **{facts['profession']}**")
-        if facts.get("college"): bits.append(f"you studied at **{facts['college']}**")
-        text = "So far, I know " + ", ".join(bits) + "." if bits else \
-               "I only know a little about you. Share more, and I’ll remember it."
-    else:
-        mem_line = build_memory_system_prompt(facts)
-        system = SystemMessage(content=f"{chitchat_base}\n\n{mem_line}\nWhen it's natural, weave one relevant fact into the reply.")
-        human = HumanMessage(content=q)
-        resp = chitchat_llm.invoke([system, human])
-        text = resp.content.strip()
+        state["messages"].append(AIMessage(content=text))
+        return state
 
-    state.setdefault("messages", [])
+    # ---------- 3) “what do you know about me?” -> list everything we have ----------
+    if re.search(r"what\s+(all\s+)?do\s+you\s+know\s+about\s+me|tell\s+me\s+about\s+myself|what\s+do\s+you\s+remember\s+about\s+me", qlow):
+        nonempty = {k: v for k, v in facts.items() if str(v).strip()}
+        if nonempty:
+            lines = []
+            for k, v in nonempty.items():
+                label = "sports you play" if k.lower() == "sports" else k.replace("_", " ")
+                lines.append(f"- **{label}**: {v}")
+            text = "Here’s what I know so far:\n" + "\n".join(lines)
+        else:
+            text = "I only know a little so far. Share more and I’ll remember it."
+        state["messages"].append(AIMessage(content=text))
+        return state
+
+    # ---------- 4) generic: “what is my <anything>?” / “do you know my <anything>?” ----------
+    m = re.search(r"(?:what(?:'s| is| are)?\s+my\s+|do\s+you\s+know\s+my\s+)([a-z0-9 _\-]{2,60})\??", qlow)
+    if m and isinstance(facts, dict) and facts:
+        asked = m.group(1).strip()
+
+        def norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+        asked_n = norm(asked)
+        best_key, best_val = None, ""
+        # try direct/containment match against ANY key in user_facts
+        for k, v in facts.items():
+            if not str(v).strip():
+                continue
+            k_n = norm(k)
+            if not k_n:
+                continue
+            if k_n == asked_n or k_n in asked_n or asked_n in k_n:
+                best_key, best_val = k, str(v).strip()
+                break
+            # token overlap heuristic
+            if any(tok and tok in k_n for tok in asked_n.split()):
+                best_key, best_val = k, str(v).strip()
+                break
+
+        if best_key and best_val:
+            label = best_key.replace("_", " ")
+            text = f"Your **{label}** is **{best_val}**."
+            state["messages"].append(AIMessage(content=text))
+            return state
+
+    # ---------- 5) friendly fallback with memory context ----------
+    mem_line = build_memory_system_prompt(facts)
+    system = SystemMessage(content=f"{chitchat_base}\n\n{mem_line}\nWhen it's natural, weave one relevant fact into the reply.")
+    resp = chitchat_llm.invoke([system, HumanMessage(content=q)])
+    text = (resp.content or "").strip()
+
     state["messages"].append(AIMessage(content=text))
     return state
+
 
 def cannot_answer(state: AgentState) -> AgentState:
     print("=== Entering cannot_answer ===")
